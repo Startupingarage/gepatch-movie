@@ -1,3 +1,6 @@
+/* GePatch Movie fork: modified 2026-10-11; restored 2026-10-12.
+ * Derived from TheOfficialFloW/GePatch v0.19.1. See LICENSE.TXT.
+ */
 #include <pspsdk.h>
 #include <pspkernel.h>
 #include <pspge.h>
@@ -8,9 +11,13 @@
 
 #include <systemctrl.h>
 
+#ifndef FindProc
+#define FindProc sctrlHENFindFunction
+#endif
+
 #include "ge_constants.h"
 
-PSP_MODULE_INFO("GePatch", 0x1007, 1, 0);
+PSP_MODULE_INFO("GePatchMovie", 0x1007, 1, 1);
 
 #define DRAW_NATIVE 0xABCDEF00
 
@@ -56,7 +63,7 @@ int checkAddress(u32 addr) {
     // log("vram address: %08x\n", addr);
     return -1;
   }
-  log("invalid address: %08x\n", addr);
+  log("invalid address: %08x\n", (unsigned int)addr);
   return -1;
 }
 
@@ -228,6 +235,39 @@ static GeState state;
 
 static int rendered_in_sync = 0;
 static int framebuf_set = 0;
+static volatile int native_frame_ready = 0;
+static volatile int video_active = 0;
+static volatile unsigned int video_last_frame = 0;
+static unsigned int trace_remaining = 64;
+
+static void tracePresentation(const char *event, u32 address, int width, int mode) {
+  if (trace_remaining) {
+    char msg[128];
+    trace_remaining--;
+    snprintf(msg, sizeof(msg), "movie-test1 %s addr=%08x width=%d mode=%d\n",
+             event, (unsigned int)address, width, mode);
+    logmsg(msg);
+  }
+}
+
+static int videoPlaybackActive(void) {
+  // shortcut: detect video through MPEG colour conversion; other codecs need separate hooks.
+  if (video_active && (unsigned int)(sceKernelGetSystemTimeLow() - video_last_frame) >= 1000000U) {
+    video_active = 0;
+    tracePresentation("video-idle", 0, 0, 0);
+  }
+  return video_active;
+}
+
+static void videoFrameConverted(void *address, int width) {
+  if (!video_active)
+    tracePresentation("video-begin", (u32)address, width, 0);
+  video_last_frame = sceKernelGetSystemTimeLow();
+  video_active = 1;
+  native_frame_ready = 0;
+  rendered_in_sync = 0;
+  *(volatile u32 *)DRAW_NATIVE = 0;
+}
 
 void resetGeState() {
   memset(&state, 0, sizeof(GeState));
@@ -285,6 +325,10 @@ void AdvanceVerts(int count, int vertex_size) {
 
 // TODO: when ignore_framebuf=1 or ignore_texture=1, dummy all non-control-flow instructions
 void patchGeList(u32 *list, u32 *stall) {
+  if (videoPlaybackActive()) {
+    sceKernelDcacheWritebackInvalidateAll();
+    return;
+  }
   union {
     float f;
     unsigned int i;
@@ -463,6 +507,8 @@ void patchGeList(u32 *list, u32 *stall) {
           break;
         }
 
+        native_frame_ready = 1;
+
         if ((state.vertex_type & GE_VTYPE_THROUGH_MASK) == GE_VTYPE_THROUGH) {
           u8 num_points_u = data & 0xff;
           u8 num_points_v = (data >> 8) & 0xff;
@@ -503,6 +549,9 @@ void patchGeList(u32 *list, u32 *stall) {
           *list = 0;
           break;
         }
+
+        if (data & 0xffff)
+          native_frame_ready = 1;
 
         if ((state.vertex_type & GE_VTYPE_THROUGH_MASK) == GE_VTYPE_THROUGH) {
           u16 count = data & 0xffff;
@@ -799,6 +848,8 @@ int sceGeListSyncPatched(int qid, int syncType) {
 }
 
 void copyFrameBuffer() {
+  if (videoPlaybackActive() || !native_frame_ready)
+    return;
   *(u32 *)DRAW_NATIVE = 1;
 
   // memcpy((void *)DISPLAY_BUFFER, (void *)VRAM_DRAW_BUFFER_OFFSET, 960*544*2);
@@ -812,6 +863,8 @@ void copyFrameBuffer() {
 
 int sceGeDrawSyncPatched(int syncType) {
   int res = _sceGeDrawSync(syncType);
+  if (videoPlaybackActive() || !native_frame_ready)
+    return res;
   if (!framebuf_set) {
     // Framebuffer was not set previously (maybe it does never change)
     if (syncType == PSP_GE_LIST_DONE || syncType == PSP_GE_LIST_DRAWING_DONE) {
@@ -825,6 +878,17 @@ int sceGeDrawSyncPatched(int syncType) {
 }
 
 int sceDisplaySetFrameBufPatched(void *topaddr, int bufferwidth, int pixelformat, int sync) {
+  static int previous_mode = -1;
+  int native = topaddr && native_frame_ready && !videoPlaybackActive();
+  if (native != previous_mode) {
+    tracePresentation("display", (u32)topaddr, bufferwidth, native);
+    previous_mode = native;
+  }
+  if (!native) {
+    *(volatile u32 *)DRAW_NATIVE = 0;
+    rendered_in_sync = 0;
+    return _sceDisplaySetFrameBuf(topaddr, bufferwidth, pixelformat, sync);
+  }
   if (!rendered_in_sync)
     copyFrameBuffer();
   rendered_in_sync = 0;
@@ -843,6 +907,69 @@ int draw_thread(SceSize args, void *argp) {
   return 0;
 }
 
+static int (*original_csc_avc)(void *, void *, int, void *);
+static int (*original_csc_vme)(void *, void *, int, void *);
+static int (*original_csc_range)(void *, void *, void *, int, void *);
+static STMOD_HANDLER previous_module_handler;
+
+static int cscAvcPatched(void *rgb, void *rgb2, int width, void *yuv) {
+  int result = original_csc_avc(rgb, rgb2, width, yuv);
+  if (result >= 0)
+    videoFrameConverted(rgb, width);
+  return result;
+}
+
+static int cscVmePatched(void *rgb, void *rgb2, int width, void *yuv) {
+  int result = original_csc_vme(rgb, rgb2, width, yuv);
+  if (result >= 0)
+    videoFrameConverted(rgb, width);
+  return result;
+}
+
+static int cscRangePatched(void *rgb, void *rgb2, void *range, int width, void *yuv) {
+  int result = original_csc_range(rgb, rgb2, range, width, yuv);
+  if (result >= 0)
+    videoFrameConverted(rgb, width);
+  return result;
+}
+
+static void *findVideoFunction(const char *module, u32 nid) {
+  void *address = (void *)FindProc(module, "sceMpegbase", nid);
+  if (!address)
+    address = (void *)FindProc(module, "sceMpegbase_driver", nid);
+  return address;
+}
+
+static void installVideoHooks(const char *module) {
+  void *address = findVideoFunction(module, 0x91929A21);
+  if (address && address != (void *)original_csc_avc) {
+    original_csc_avc = address;
+    sctrlHENPatchSyscall(address, cscAvcPatched);
+    tracePresentation("hook-avc", (u32)address, 0, 0);
+  }
+  address = findVideoFunction(module, 0xCE8EB837);
+  if (address && address != (void *)original_csc_vme) {
+    original_csc_vme = address;
+    sctrlHENPatchSyscall(address, cscVmePatched);
+    tracePresentation("hook-vme", (u32)address, 0, 0);
+  }
+  address = findVideoFunction(module, 0x304882E1);
+  if (address && address != (void *)original_csc_range) {
+    original_csc_range = address;
+    sctrlHENPatchSyscall(address, cscRangePatched);
+    tracePresentation("hook-range", (u32)address, 0, 0);
+  }
+  sceKernelDcacheWritebackInvalidateAll();
+  sceKernelIcacheClearAll();
+}
+
+static int onVideoModuleStart(SceModule *module) {
+  int result = previous_module_handler ? previous_module_handler(module) : 0;
+  if (strstr(module->modname, "Mpegbase") || strstr(module->modname, "mpegbase"))
+    installVideoHooks(module->modname);
+  return result;
+}
+
 int module_start(SceSize args, void *argp) {
   _sceGeEdramGetAddr = (void *)FindProc("sceGE_Manager", "sceGe_driver", 0xE47E40E4);
   _sceGeEdramGetSize = (void *)FindProc("sceGE_Manager", "sceGe_driver", 0x1F6752AD);
@@ -853,16 +980,22 @@ int module_start(SceSize args, void *argp) {
   _sceGeListSync = (void *)FindProc("sceGE_Manager", "sceGe_driver", 0x03444EB4);
   _sceGeDrawSync = (void *)FindProc("sceGE_Manager", "sceGe_driver", 0xB287BD61);
 
-  sctrlHENPatchSyscall((u32)_sceGeEdramGetAddr, sceGeEdramGetAddrPatched);
-  sctrlHENPatchSyscall((u32)_sceGeEdramGetSize, sceGeEdramGetSizePatched);
-  sctrlHENPatchSyscall((u32)_sceGeListUpdateStallAddr, sceGeListUpdateStallAddrPatched);
-  sctrlHENPatchSyscall((u32)_sceGeListEnQueue, sceGeListEnQueuePatched);
-  sctrlHENPatchSyscall((u32)_sceGeListEnQueueHead, sceGeListEnQueueHeadPatched);
+  sctrlHENPatchSyscall((void *)_sceGeEdramGetAddr, sceGeEdramGetAddrPatched);
+  sctrlHENPatchSyscall((void *)_sceGeEdramGetSize, sceGeEdramGetSizePatched);
+  sctrlHENPatchSyscall((void *)_sceGeListUpdateStallAddr, sceGeListUpdateStallAddrPatched);
+  sctrlHENPatchSyscall((void *)_sceGeListEnQueue, sceGeListEnQueuePatched);
+  sctrlHENPatchSyscall((void *)_sceGeListEnQueueHead, sceGeListEnQueueHeadPatched);
   // sctrlHENPatchSyscall((u32)_sceGeListSync, sceGeListSyncPatched);
-  sctrlHENPatchSyscall((u32)_sceGeDrawSync, sceGeDrawSyncPatched);
+  sctrlHENPatchSyscall((void *)_sceGeDrawSync, sceGeDrawSyncPatched);
 
   _sceDisplaySetFrameBuf = (void *)FindProc("sceDisplay_Service", "sceDisplay_driver", 0x289D82FE);
-  sctrlHENPatchSyscall((u32)_sceDisplaySetFrameBuf, sceDisplaySetFrameBufPatched);
+  sctrlHENPatchSyscall((void *)_sceDisplaySetFrameBuf, sceDisplaySetFrameBufPatched);
+
+  logmsg("movie-test1 loaded\n");
+  previous_module_handler = sctrlHENSetStartModuleHandler(onVideoModuleStart);
+  installVideoHooks("sceMpegbase_Driver");
+  installVideoHooks("sceMpegbase");
+  installVideoHooks("sceMpegbase_library");
 
   // SceUID thid = sceKernelCreateThread("draw_thread", draw_thread, 0x11, 0x4000, 0, NULL);
   // if (thid >= 0)

@@ -126,7 +126,9 @@ int sceGuFinish(void)
   return 0;
 }
 
-void sceGuStart(int cid, void* list)
+/* GePatch Movie fork: PSPDEV return type corrected 2026-10-11. */
+int sceGuStart(int cid, void* list)
 {
   current = (unsigned int*)((unsigned int)list);
+  return 0;
 }
